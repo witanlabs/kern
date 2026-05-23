@@ -1,0 +1,4 @@
+interface:
+  display_name: "Kern"
+  short_description: "Use persistent Python Jupyter kernels from shell sandboxes."
+  default_prompt: "Use kern for persistent Python execution when stateful analysis, dataframes, or plots are useful."
