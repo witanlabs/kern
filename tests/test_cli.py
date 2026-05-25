@@ -48,6 +48,7 @@ def project(tmp_path: Path):
     finally:
         run_kern(project, "stop", "py")
         run_kern(project, "stop", "py@scratch")
+        run_kern(project, "stop", "js")
 
 
 @pytest.fixture()
@@ -187,3 +188,41 @@ def test_bootstrap_installs_missing_ipykernel(tmp_path: Path) -> None:
     assert persisted.stdout.strip() == "8"
 
     run_kern(project, "stop", "py")
+
+
+def test_js_bootstrap_project_modules_imports_and_persistence(tmp_path: Path) -> None:
+    if shutil.which("node") is None or shutil.which("npm") is None:
+        pytest.skip("node and npm are required for js bootstrap")
+
+    project = tmp_path / "js-project"
+    project.mkdir()
+    subprocess.run(["git", "init", "--quiet"], cwd=project, check=True)
+    subprocess.run(["npm", "init", "-y"], cwd=project, check=True, stdout=subprocess.DEVNULL)
+    subprocess.run(["npm", "install", "left-pad"], cwd=project, check=True, stdout=subprocess.DEVNULL)
+
+    missing = run_kern(project, "js", "1 + 1")
+    assert missing.returncode == 3
+    assert "does not have tslab installed" in missing.stderr
+
+    bootstrapped = run_kern(project, "--bootstrap", "js", "var value = 41; value")
+    assert bootstrapped.returncode == 0, bootstrapped.stderr
+    assert bootstrapped.stdout.strip() == "41"
+    assert (project / ".kern" / "kernels" / "js" / "node_modules" / ".bin" / "tslab").exists()
+
+    persisted = run_kern(project, "js", "value + 1")
+    assert persisted.returncode == 0, persisted.stderr
+    assert persisted.stdout.strip() == "42"
+
+    require_result = run_kern(project, "js", 'const leftPad = require("left-pad"); leftPad("x", 3, "0")')
+    assert require_result.returncode == 0, require_result.stderr
+    assert require_result.stdout.strip() == "00x"
+
+    import_result = run_kern(project, "js", 'import path from "node:path"; path.basename("a/b.txt")')
+    assert import_result.returncode == 0, import_result.stderr
+    assert import_result.stdout.strip() == "b.txt"
+
+    await_result = run_kern(project, "js", 'const mod = await import("node:path"); mod.basename("a/b.txt")')
+    assert await_result.returncode == 0, await_result.stderr
+    assert await_result.stdout.strip() == "b.txt"
+
+    run_kern(project, "stop", "js")

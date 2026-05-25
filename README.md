@@ -1,15 +1,16 @@
 ## kern
 
-`kern` is a prototype CLI for persistent Python execution from shell-based agent
-sandboxes. It lets an agent submit code to a long-running Jupyter `ipykernel`
+`kern` is a prototype CLI for persistent kernel execution from shell-based agent
+sandboxes. It lets an agent submit code to a long-running Jupyter-style kernel
 from ordinary shell commands, so later calls can reuse variables, imports, data
-frames, and plotting state.
+frames, plotting state, and JavaScript module state.
 
 The initial scope is deliberately narrow:
 
-- Python only, addressed as `py` or `py@session`
+- Python, addressed as `py` or `py@session`
+- JavaScript, addressed as `js` or `js@session`, backed by TSLab JS mode
 - project-local state under `.kern/`
-- opt-in bootstrap for missing `ipykernel`
+- opt-in bootstrap for missing runtime support
 - text output to stdout/stderr
 - rich outputs saved as files for later inspection
 
@@ -28,7 +29,9 @@ Run the local development copy:
 
 ```bash
 uv run kern py '1 + 1'
+uv run kern --bootstrap js '1 + 1'
 uv run kern stop py
+uv run kern stop js
 ```
 
 Example output shapes:
@@ -58,6 +61,25 @@ Plots and images are saved as files:
 [kern artifact] image/png /repo/.kern/artifacts/<session>/cell-0004-output-1-ab12cd34.png
 ```
 
+JavaScript sessions run in the project root and can use project `node_modules`:
+
+```bash
+kern js 'var value = 41; value'
+kern js 'value + 1'
+```
+
+```text
+42
+```
+
+TSLab JS mode supports both CommonJS and ESM syntax:
+
+```bash
+kern js 'const fs = require("node:fs"); fs.existsSync("package.json")'
+kern js 'import path from "node:path"; path.basename("a/b.txt")'
+kern js 'const mod = await import("node:path"); mod.basename("a/b.txt")'
+```
+
 JSON mode emits one JSON object:
 
 ```json
@@ -70,7 +92,7 @@ JSON mode emits one JSON object:
 }
 ```
 
-The test suite creates temporary projects with their own `.venv` directories and
-real `ipykernel` processes. Tests should stop their kernels during cleanup; if a
-run is interrupted, inspect and remove temporary `.kern/` directories or stop
-leftover kernels manually.
+The test suite creates temporary projects with their own `.venv` directories,
+real `ipykernel` processes, and TSLab-backed JS kernels. Tests should stop their
+kernels during cleanup; if a run is interrupted, inspect and remove temporary
+`.kern/` directories or stop leftover kernels manually.

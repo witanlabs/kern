@@ -23,7 +23,7 @@ from jupyter_client.connect import write_connection_file
 
 
 DEFAULT_SESSION = "default"
-VALID_KERNEL = "py"
+VALID_KERNELS = {"py", "js"}
 KERN_HOME_ENV = "KERN_HOME"
 
 
@@ -34,11 +34,25 @@ class KernError(Exception):
 
 
 @dataclass
+class KernelIdent:
+    kernel: str
+    session: str
+
+
+@dataclass
+class Runtime:
+    executable: str
+    version: str
+
+
+@dataclass
 class SessionRecord:
     id: str
     scope: str
+    kernel: str
     session: str
-    python: str
+    executable: str
+    version: str
     pid: int
     connection_file: str
     log_file: str
@@ -83,12 +97,12 @@ def main(argv: list[str] | None = None) -> int:
 def run(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         prog="kern",
-        description="Execute Python code in a persistent Jupyter kernel.",
+        description="Execute code in a persistent Jupyter kernel.",
     )
     parser.add_argument(
         "--bootstrap",
         action="store_true",
-        help="Install missing ipykernel support in the selected Python.",
+        help="Install missing kernel support for the selected runtime.",
     )
     parser.add_argument("--json", action="store_true", help="Emit one JSON object.")
     parser.add_argument("--timeout", type=float, default=None, help="Maximum seconds to wait for execution.")
@@ -96,29 +110,40 @@ def run(argv: list[str]) -> int:
     ns = parser.parse_args(argv)
 
     if not ns.args:
-        raise KernError("missing kernel ident; expected py or py@session", 2)
+        raise KernError("missing kernel ident; expected py, py@session, js, or js@session", 2)
 
     ident = ns.args[0]
-    session = parse_ident(ident)
+    parsed = parse_ident(ident)
     code = read_code(ns.args[1:])
     scope = find_scope(Path.cwd())
-    python = resolve_python(Path.cwd())
+    runtime = resolve_runtime(parsed.kernel, Path.cwd())
 
-    if not has_ipykernel(python):
+    if parsed.kernel == "py" and not has_ipykernel(runtime.executable):
         if not ns.bootstrap:
             raise KernError(
                 "selected Python does not have ipykernel installed\n"
-                f"python: {python}\n\n"
+                f"python: {runtime.executable}\n\n"
                 f"Run:\n  kern --bootstrap {ident} {quote_code_for_hint(code)}\n"
-                f"or:\n  {python} -m pip install ipykernel",
+                f"or:\n  {runtime.executable} -m pip install ipykernel",
                 3,
             )
-        install_ipykernel(python)
+        install_ipykernel(runtime.executable)
+    elif parsed.kernel == "js" and not has_tslab(scope):
+        if not ns.bootstrap:
+            raise KernError(
+                "selected project does not have tslab installed for kern\n\n"
+                f"Run:\n  kern --bootstrap {ident} {quote_code_for_hint(code)}",
+                3,
+            )
+        install_tslab(scope)
+    elif parsed.kernel == "js":
+        expose_node_types(scope)
 
-    record = ensure_session(scope, session, python)
+    record = ensure_session(scope, parsed, runtime)
     result = execute(record, code, timeout=ns.timeout)
     render_result(result, json_mode=ns.json)
-    touch_session(record)
+    if record.kernel != "js":
+        touch_session(record)
     return 0 if result.ok else 1
 
 
@@ -126,10 +151,10 @@ def manage_session(command: str, argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog=f"kern {command}")
     parser.add_argument("ident")
     ns = parser.parse_args(argv)
-    session = parse_ident(ns.ident)
+    parsed = parse_ident(ns.ident)
     scope = find_scope(Path.cwd())
-    python = resolve_python(Path.cwd())
-    session_id = make_session_id(scope, session, python)
+    runtime = resolve_runtime(parsed.kernel, Path.cwd())
+    session_id = make_session_id(scope, parsed, runtime)
     with locked_registry(scope) as registry:
         record_data = registry.get(session_id)
         if record_data is None:
@@ -139,7 +164,7 @@ def manage_session(command: str, argv: list[str]) -> int:
         stop_record(record)
         registry.pop(session_id, None)
     if command == "restart":
-        ensure_session(scope, session, python)
+        ensure_session(scope, parsed, runtime)
         print(f"restarted {ns.ident}")
     else:
         print(f"stopped {ns.ident}")
@@ -161,24 +186,26 @@ def list_sessions() -> int:
         print("no running sessions")
         return 0
 
-    print(f"{'IDENT':<14} {'PID':<8} {'PYTHON':<36} {'SCOPE'}")
-    for record in sorted(rows, key=lambda row: (row.scope, row.session)):
-        ident = "py" if record.session == DEFAULT_SESSION else f"py@{record.session}"
-        python = shorten_middle(record.python, 36)
-        print(f"{ident:<14} {record.pid:<8} {python:<36} {record.scope}")
+    print(f"{'IDENT':<14} {'PID':<8} {'RUNTIME':<36} {'SCOPE'}")
+    for record in sorted(rows, key=lambda row: (row.scope, row.kernel, row.session)):
+        ident = record.kernel if record.session == DEFAULT_SESSION else f"{record.kernel}@{record.session}"
+        runtime = shorten_middle(runtime_label(record), 36)
+        print(f"{ident:<14} {record.pid:<8} {runtime:<36} {record.scope}")
     return 0
 
 
-def parse_ident(ident: str) -> str:
-    if ident == VALID_KERNEL:
-        return DEFAULT_SESSION
-    prefix = f"{VALID_KERNEL}@"
-    if ident.startswith(prefix) and ident != prefix:
-        session = ident[len(prefix) :]
-        if "/" in session or "\\" in session:
-            raise KernError("session name cannot contain path separators", 2)
-        return session
-    raise KernError("unsupported kernel ident; v1 supports py or py@session", 2)
+def parse_ident(ident: str) -> KernelIdent:
+    if "@" in ident:
+        kernel, session = ident.split("@", 1)
+        if not session:
+            raise KernError("session name cannot be empty", 2)
+    else:
+        kernel, session = ident, DEFAULT_SESSION
+    if kernel not in VALID_KERNELS:
+        raise KernError("unsupported kernel ident; expected py, py@session, js, or js@session", 2)
+    if "/" in session or "\\" in session:
+        raise KernError("session name cannot contain path separators", 2)
+    return KernelIdent(kernel=kernel, session=session)
 
 
 def read_code(parts: list[str]) -> str:
@@ -222,6 +249,43 @@ def resolve_python(cwd: Path) -> str:
     raise KernError("could not find python3 on PATH", 3)
 
 
+def resolve_runtime(kernel: str, cwd: Path) -> Runtime:
+    if kernel == "py":
+        python = resolve_python(cwd)
+        return Runtime(executable=python, version=python_version(python))
+    if kernel == "js":
+        node = shutil.which("node")
+        if node is None:
+            raise KernError("could not find node on PATH", 3)
+        node_path = str(Path(node).resolve())
+        return Runtime(executable=node_path, version=node_version(node_path))
+    raise KernError(f"unsupported kernel: {kernel}", 2)
+
+
+def python_version(python: str) -> str:
+    result = subprocess.run(
+        [python, "--version"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=False,
+    )
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def node_version(node: str) -> str:
+    result = subprocess.run(
+        [node, "--version"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise KernError(f"failed to run {node} --version", 3)
+    return result.stdout.strip()
+
+
 def has_ipykernel(python: str) -> bool:
     result = subprocess.run(
         [python, "-c", "import ipykernel"],
@@ -259,8 +323,47 @@ def has_pip(python: str) -> bool:
     return result.returncode == 0
 
 
-def ensure_session(scope: Path, session: str, python: str) -> SessionRecord:
-    session_id = make_session_id(scope, session, python)
+def has_tslab(scope: Path) -> bool:
+    return tslab_bin(scope).exists()
+
+
+def install_tslab(scope: Path) -> None:
+    npm = shutil.which("npm")
+    if npm is None:
+        raise KernError("could not find npm on PATH; npm is required for kern --bootstrap js", 3)
+    prefix = kern_home(scope) / "kernels" / "js"
+    ensure_private_dir(prefix)
+    print(f"installing tslab into {prefix}", file=sys.stderr)
+    result = subprocess.run(
+        [npm, "install", "--prefix", str(prefix), "tslab"],
+        stdout=subprocess.DEVNULL,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise KernError("failed to install tslab", 3)
+    expose_node_types(scope)
+
+
+def expose_node_types(scope: Path) -> None:
+    source = kern_home(scope) / "kernels" / "js" / "node_modules" / "@types" / "node"
+    if not source.exists():
+        return
+    target = scope / "node_modules" / "@types" / "node"
+    if target.exists():
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        target.symlink_to(os.path.relpath(source, target.parent), target_is_directory=True)
+    except OSError:
+        shutil.copytree(source, target)
+
+
+def tslab_bin(scope: Path) -> Path:
+    return kern_home(scope) / "kernels" / "js" / "node_modules" / ".bin" / "tslab"
+
+
+def ensure_session(scope: Path, ident: KernelIdent, runtime: Runtime) -> SessionRecord:
+    session_id = make_session_id(scope, ident, runtime)
     with locked_registry(scope) as registry:
         existing = registry.get(session_id)
         if existing is not None:
@@ -273,11 +376,14 @@ def ensure_session(scope: Path, session: str, python: str) -> SessionRecord:
         ensure_private_dir(log_dir(scope))
         connection_file = runtime_dir(scope) / f"{session_id}.json"
         log_file = log_dir(scope) / f"{session_id}.log"
-        write_connection_file(fname=str(connection_file))
+        if ident.kernel == "js":
+            write_connection_file(fname=str(connection_file), key=uuid4().hex.encode("ascii"))
+        else:
+            write_connection_file(fname=str(connection_file))
         chmod_private_file(connection_file)
         with log_file.open("ab") as log:
             proc = subprocess.Popen(
-                [python, "-m", "ipykernel_launcher", "-f", str(connection_file)],
+                kernel_command(scope, ident.kernel, runtime.executable, connection_file),
                 cwd=str(scope),
                 stdin=subprocess.DEVNULL,
                 stdout=log,
@@ -288,8 +394,10 @@ def ensure_session(scope: Path, session: str, python: str) -> SessionRecord:
         record = SessionRecord(
             id=session_id,
             scope=str(scope),
-            session=session,
-            python=python,
+            kernel=ident.kernel,
+            session=ident.session,
+            executable=runtime.executable,
+            version=runtime.version,
             pid=proc.pid,
             connection_file=str(connection_file),
             log_file=str(log_file),
@@ -308,6 +416,21 @@ def ensure_session(scope: Path, session: str, python: str) -> SessionRecord:
                 registry.pop(session_id, None)
         raise
     return record
+
+
+def kernel_command(scope: Path, kernel: str, executable: str, connection_file: Path) -> list[str]:
+    if kernel == "py":
+        return [executable, "-m", "ipykernel_launcher", "-f", str(connection_file)]
+    if kernel == "js":
+        return [
+            executable,
+            str(tslab_bin(scope)),
+            "kernel",
+            "--js",
+            "--config-path",
+            str(connection_file),
+        ]
+    raise KernError(f"unsupported kernel: {kernel}", 2)
 
 
 def execute(record: SessionRecord, code: str, timeout: float | None) -> ExecutionResult:
@@ -352,9 +475,23 @@ def execute(record: SessionRecord, code: str, timeout: float | None) -> Executio
                 events.append(OutputEvent(type="error", text=traceback))
             elif msg_type == "execute_input":
                 execution_count = content.get("execution_count", execution_count)
+        reply_timeout = 1.0 if deadline is None else max(0.1, deadline - time.monotonic())
+        reply = get_shell_reply(client, msg_id, timeout=reply_timeout)
+        if reply.get("status") != "ok":
+            ok = False
         return ExecutionResult(ok=ok, execution_count=execution_count, events=events)
     finally:
         client.stop_channels()
+
+
+def get_shell_reply(client: BlockingKernelClient, msg_id: str, timeout: float) -> dict[str, Any]:
+    while True:
+        try:
+            msg = client.get_shell_msg(timeout=timeout)
+        except (TimeoutError, Empty):
+            return {}
+        if msg.get("parent_header", {}).get("msg_id") == msg_id:
+            return msg.get("content", {})
 
 
 def connect_client(record: SessionRecord, timeout: float) -> BlockingKernelClient:
@@ -492,17 +629,27 @@ def is_session_alive(record: SessionRecord) -> bool:
     if result.returncode != 0:
         return True
     command = result.stdout
-    return "ipykernel" in command and record.connection_file in command
+    marker = "ipykernel" if record.kernel == "py" else "tslab"
+    return marker in command and record.connection_file in command
 
 
-def make_session_id(scope: Path, session: str, python: str) -> str:
-    raw = f"{scope.resolve()}\0{session}\0{Path(python).absolute()}"
+def make_session_id(scope: Path, ident: KernelIdent, runtime: Runtime) -> str:
+    raw = f"{scope.resolve()}\0{ident.kernel}\0{ident.session}\0{runtime.executable}\0{runtime.version}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
 
 
 def session_record_from_data(data: dict[str, Any]) -> SessionRecord:
+    data = dict(data)
+    if "kernel" not in data:
+        data["kernel"] = "py"
+    if "executable" not in data:
+        data["executable"] = data.pop("python", "")
+    else:
+        data.pop("python", None)
+    if "version" not in data:
+        data["version"] = ""
     if "log_file" not in data:
-        data = {**data, "log_file": ""}
+        data["log_file"] = ""
     return SessionRecord(**data)
 
 
@@ -515,10 +662,12 @@ def locked_registry(scope: Path):
     with lock_path.open("r+") as lock_file:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
         registry = load_registry(scope)
+        original = json.dumps(registry, sort_keys=True)
         try:
             yield registry
         finally:
-            save_registry(scope, registry)
+            if json.dumps(registry, sort_keys=True) != original:
+                save_registry(scope, registry)
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
@@ -621,3 +770,9 @@ def shorten_middle(value: str, width: int) -> str:
     left = keep // 2
     right = keep - left
     return f"{value[:left]}...{value[-right:]}"
+
+
+def runtime_label(record: SessionRecord) -> str:
+    if record.version:
+        return f"{record.executable} ({record.version})"
+    return record.executable
