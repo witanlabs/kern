@@ -15,6 +15,11 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def needs_node() -> None:
+    if shutil.which("node") is None or shutil.which("npm") is None:
+        pytest.skip("node and npm are required for js tests")
+
+
 def run_kern(project: Path, *args: str, input_text: str | None = None, env_extra: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env.pop("VIRTUAL_ENV", None)
@@ -192,8 +197,7 @@ def test_bootstrap_installs_missing_ipykernel(tmp_path: Path) -> None:
 
 
 def test_js_bootstrap_project_modules_imports_and_persistence(tmp_path: Path) -> None:
-    if shutil.which("node") is None or shutil.which("npm") is None:
-        pytest.skip("node and npm are required for js bootstrap")
+    needs_node()
 
     project = tmp_path / "js-project"
     project.mkdir()
@@ -230,8 +234,7 @@ def test_js_bootstrap_project_modules_imports_and_persistence(tmp_path: Path) ->
 
 
 def test_js_execution_does_not_rewrite_kern_bookkeeping(tmp_path: Path) -> None:
-    if shutil.which("node") is None or shutil.which("npm") is None:
-        pytest.skip("node and npm are required for js bootstrap")
+    needs_node()
 
     project = tmp_path / "js-watch-project"
     project.mkdir()
@@ -258,5 +261,106 @@ def test_js_execution_does_not_rewrite_kern_bookkeeping(tmp_path: Path) -> None:
         for path in [registry, lock]
     }
     assert after == before
+
+    run_kern(project, "stop", "js")
+
+
+def test_js_stdin_json_and_named_session(tmp_path: Path) -> None:
+    needs_node()
+
+    project = tmp_path / "js-io-project"
+    project.mkdir()
+    subprocess.run(["git", "init", "--quiet"], cwd=project, check=True)
+    subprocess.run(["npm", "init", "-y"], cwd=project, check=True, stdout=subprocess.DEVNULL)
+
+    bootstrapped = run_kern(project, "--bootstrap", "js", "var x = 10; x")
+    assert bootstrapped.returncode == 0, bootstrapped.stderr
+
+    stdin_result = run_kern(
+        project,
+        "js",
+        input_text="var y = x * 2;\ny\n",
+    )
+    assert stdin_result.returncode == 0, stdin_result.stderr
+    assert stdin_result.stdout.strip() == "20"
+
+    named_set = run_kern(project, "js@scratch", "var x = 100; x")
+    assert named_set.returncode == 0, named_set.stderr
+    assert named_set.stdout.strip() == "100"
+
+    named_get = run_kern(project, "js@scratch", "x + 1")
+    assert named_get.returncode == 0, named_get.stderr
+    assert named_get.stdout.strip() == "101"
+
+    default_get = run_kern(project, "--json", "js", "x + 1")
+    assert default_get.returncode == 0, default_get.stderr
+    payload = json.loads(default_get.stdout)
+    assert payload["ok"] is True
+    assert payload["events"] == [
+        {"type": "stream", "text": "11\n", "name": "stdout"},
+    ]
+
+    run_kern(project, "stop", "js")
+    run_kern(project, "stop", "js@scratch")
+
+
+def test_js_ls_stop_and_restart(tmp_path: Path) -> None:
+    needs_node()
+
+    project = tmp_path / "js-management-project"
+    project.mkdir()
+    subprocess.run(["git", "init", "--quiet"], cwd=project, check=True)
+    subprocess.run(["npm", "init", "-y"], cwd=project, check=True, stdout=subprocess.DEVNULL)
+
+    bootstrapped = run_kern(project, "--bootstrap", "js", "var value = 7; value")
+    assert bootstrapped.returncode == 0, bootstrapped.stderr
+
+    listed = run_kern(project, "ls")
+    assert listed.returncode == 0, listed.stderr
+    assert "js" in listed.stdout
+    pid_before_restart = re.search(r"^js\s+(\d+)", listed.stdout, re.MULTILINE)
+    assert pid_before_restart is not None
+
+    restarted = run_kern(project, "restart", "js")
+    assert restarted.returncode == 0, restarted.stderr
+    assert "restarted js" in restarted.stdout
+
+    listed_after_restart = run_kern(project, "ls")
+    assert listed_after_restart.returncode == 0, listed_after_restart.stderr
+    pid_after_restart = re.search(r"^js\s+(\d+)", listed_after_restart.stdout, re.MULTILINE)
+    assert pid_after_restart is not None
+    assert pid_after_restart.group(1) != pid_before_restart.group(1)
+
+    after_restart = run_kern(project, "js", "var valueAfterRestart = 1; valueAfterRestart")
+    assert after_restart.returncode == 0, after_restart.stderr
+    assert after_restart.stdout.strip() == "1"
+
+    stopped = run_kern(project, "stop", "js")
+    assert stopped.returncode == 0, stopped.stderr
+    assert "stopped js" in stopped.stdout
+
+    listed_after_stop = run_kern(project, "ls")
+    assert listed_after_stop.returncode == 0, listed_after_stop.stderr
+    assert "no running sessions" in listed_after_stop.stdout
+
+
+def test_js_error_returns_nonzero_and_session_remains_usable(tmp_path: Path) -> None:
+    needs_node()
+
+    project = tmp_path / "js-error-project"
+    project.mkdir()
+    subprocess.run(["git", "init", "--quiet"], cwd=project, check=True)
+    subprocess.run(["npm", "init", "-y"], cwd=project, check=True, stdout=subprocess.DEVNULL)
+
+    bootstrapped = run_kern(project, "--bootstrap", "js", "var value = 5; value")
+    assert bootstrapped.returncode == 0, bootstrapped.stderr
+
+    failed = run_kern(project, "js", 'throw new Error("boom")')
+    assert failed.returncode == 1
+    assert "Error: boom" in failed.stderr
+
+    reused = run_kern(project, "js", "value + 1")
+    assert reused.returncode == 0, reused.stderr
+    assert reused.stdout.strip() == "6"
 
     run_kern(project, "stop", "js")

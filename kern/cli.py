@@ -137,6 +137,7 @@ def run(argv: list[str]) -> int:
             )
         install_tslab(scope)
     elif parsed.kernel == "js":
+        patch_tslab(scope)
         expose_node_types(scope)
 
     record = ensure_session(scope, parsed, runtime)
@@ -341,7 +342,68 @@ def install_tslab(scope: Path) -> None:
     )
     if result.returncode != 0:
         raise KernError("failed to install tslab", 3)
+    patch_tslab(scope)
     expose_node_types(scope)
+
+
+def patch_tslab(scope: Path) -> None:
+    converter = kern_home(scope) / "kernels" / "js" / "node_modules" / "tslab" / "dist" / "converter.js"
+    if not converter.exists():
+        return
+    text = converter.read_text(encoding="utf-8")
+    marker = "kern patch: ignore mutable .kern paths"
+    if marker in text:
+        return
+
+    text = text.replace(
+        "function createConverter(options) {\n    const cwd = ts.sys.getCurrentDirectory();",
+        "function createConverter(options) {\n"
+        "    const cwd = ts.sys.getCurrentDirectory();\n"
+        f"    // {marker}\n"
+        "    const kernIgnoredPaths = [\n"
+        "        (0, tspath_1.normalizeJoin)(cwd, \".kern\", \"runtime\"),\n"
+        "        (0, tspath_1.normalizeJoin)(cwd, \".kern\", \"logs\"),\n"
+        "        (0, tspath_1.normalizeJoin)(cwd, \".kern\", \"artifacts\"),\n"
+        "        (0, tspath_1.normalizeJoin)(cwd, \".kern\", \"sessions.json\"),\n"
+        "        (0, tspath_1.normalizeJoin)(cwd, \".kern\", \"sessions.lock\"),\n"
+        "    ];\n"
+        "    function isKernIgnoredPath(path) {\n"
+        "        const normalized = (0, tspath_1.normalizeSlashes)(path);\n"
+        "        return kernIgnoredPaths.some((ignored) => normalized === ignored || normalized.startsWith(ignored + \"/\"));\n"
+        "    }",
+    )
+    text = text.replace(
+        "    sys.readDirectory = function (path, extensions, exclude, include, depth) {\n"
+        "        return ts.sys.readDirectory(forwardTslabPath(cwd, path), extensions, exclude, include, depth);\n"
+        "    };",
+        "    sys.readDirectory = function (path, extensions, exclude, include, depth) {\n"
+        "        return ts.sys.readDirectory(forwardTslabPath(cwd, path), extensions, exclude, include, depth)\n"
+        "            .filter((entry) => !isKernIgnoredPath(entry));\n"
+        "    };",
+    )
+    text = text.replace(
+        "        // Note: File watchers for real files and virtual files are mixed here.\n",
+        "        if (isKernIgnoredPath(path)) {\n"
+        "            return { close: () => { } };\n"
+        "        }\n"
+        "        // Note: File watchers for real files and virtual files are mixed here.\n",
+    )
+    text = text.replace(
+        "    // This takes several hundreds millisecs.\n"
+        "    const host = ts.createWatchCompilerHost(Array.from(rootFiles), {",
+        "    sys.watchDirectory = (path, callback, recursive, options) => {\n"
+        "        return ts.sys.watchDirectory(path, (fileName) => {\n"
+        "            if (!isKernIgnoredPath(fileName)) {\n"
+        "                callback(fileName);\n"
+        "            }\n"
+        "        }, recursive, options);\n"
+        "    };\n"
+        "    // This takes several hundreds millisecs.\n"
+        "    const host = ts.createWatchCompilerHost(Array.from(rootFiles), {",
+    )
+    if marker not in text:
+        raise KernError("failed to patch tslab converter", 3)
+    converter.write_text(text, encoding="utf-8")
 
 
 def expose_node_types(scope: Path) -> None:
