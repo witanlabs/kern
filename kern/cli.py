@@ -657,7 +657,8 @@ def session_record_from_data(data: dict[str, Any]) -> SessionRecord:
 def locked_registry(scope: Path):
     ensure_private_dir(kern_home(scope))
     lock_path = registry_lock_path(scope)
-    lock_path.touch(exist_ok=True)
+    if not lock_path.exists():
+        lock_path.touch()
     chmod_private_file(lock_path)
     with lock_path.open("r+") as lock_file:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)

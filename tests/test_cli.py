@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -224,5 +225,38 @@ def test_js_bootstrap_project_modules_imports_and_persistence(tmp_path: Path) ->
     await_result = run_kern(project, "js", 'const mod = await import("node:path"); mod.basename("a/b.txt")')
     assert await_result.returncode == 0, await_result.stderr
     assert await_result.stdout.strip() == "b.txt"
+
+    run_kern(project, "stop", "js")
+
+
+def test_js_execution_does_not_rewrite_kern_bookkeeping(tmp_path: Path) -> None:
+    if shutil.which("node") is None or shutil.which("npm") is None:
+        pytest.skip("node and npm are required for js bootstrap")
+
+    project = tmp_path / "js-watch-project"
+    project.mkdir()
+    subprocess.run(["git", "init", "--quiet"], cwd=project, check=True)
+    subprocess.run(["npm", "init", "-y"], cwd=project, check=True, stdout=subprocess.DEVNULL)
+
+    bootstrapped = run_kern(project, "--bootstrap", "js", "var value = 41; value")
+    assert bootstrapped.returncode == 0, bootstrapped.stderr
+
+    registry = project / ".kern" / "sessions.json"
+    lock = project / ".kern" / "sessions.lock"
+    before = {
+        path: (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in [registry, lock]
+    }
+
+    time.sleep(0.01)
+    result = run_kern(project, "js", "value + 1")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "42"
+
+    after = {
+        path: (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in [registry, lock]
+    }
+    assert after == before
 
     run_kern(project, "stop", "js")
